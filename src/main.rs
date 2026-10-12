@@ -1,23 +1,14 @@
-use clap::{Parser, Subcommand, ValueHint};
-use git2::{
-    Binding, Commit, IndexTime, Oid, Repository, Signature, Time, Tree, build::CheckoutBuilder,
-};
-use itertools::Itertools;
-use miette::{Context, Error, IntoDiagnostic, Result};
-use rayon::prelude::*;
+use clap::{CommandFactory, Parser, Subcommand, ValueHint};
+use clap_complete::{Shell, generate};
+use git2::{Commit, Oid, Repository, Signature, Time, Tree, build::CheckoutBuilder};
+use miette::{Context, IntoDiagnostic, Result};
 use regex::Regex;
 use std::{
     collections::HashMap,
-    fs,
-    path::PathBuf,
+    io,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-
-struct RemoteRepoInfo {
-    pub name: &'static str,
-    pub url: &'static str,
-    pub github_path: &'static str,
-}
 
 pub struct CommitBuilder<'a> {
     author: Signature<'a>,
@@ -36,7 +27,7 @@ pub struct CommitBuilder<'a> {
     about = "allows you to copy commits from one git repo to another, use the current checkout branch on the destination repo"
 )]
 #[clap(after_help = "Hi")]
-#[command(version, long_about = None)]
+#[command(name = "git_commit_copy", version, long_about = None)]
 pub struct Args {
     #[arg(value_name = "list of commits", value_hint = ValueHint::Url)]
     commits: Vec<String>,
@@ -65,10 +56,34 @@ pub struct Args {
         default_value_t = false
     )]
     fix_date: bool,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    Completions {
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    match args.command {
+        Some(Commands::Completions { shell }) => {
+            generate(
+                shell,
+                &mut Args::command(),
+                "git_commit_copy",
+                &mut io::stdout(),
+            );
+            return Ok(());
+        }
+        None => {}
+    }
 
     let src = Repository::open(&args.src)
         .into_diagnostic()
@@ -84,7 +99,7 @@ fn main() -> Result<()> {
         .into_diagnostic()
         .context("failed to get all commits")?;
 
-    import_objects(
+    _ = import_objects(
         &dst,
         &src,
         &args
@@ -94,8 +109,7 @@ fn main() -> Result<()> {
             .ok_or(miette::Error::msg("couldn't find a good name for src repo"))?
             .as_os_str()
             .to_string_lossy(),
-    )
-    .into_diagnostic()?;
+    );
 
     migrate_commits(
         &dst,
@@ -193,25 +207,34 @@ fn migrate_commits(
                 new_parents
             };
 
-            let tree = dst.find_tree(if let Some(prefix) = prefix {
-                prefixed_tree(dst, &commit.tree, prefix)?
-            } else {
-                commit.tree.id()
-            })?;
-            let new_commit = dst.commit(
-                None,
+            // Current destination tree.
+            let base_tree = parent.tree()?;
+
+            let tree_oid = mk_new_tree(dst, prefix, &commit, base_tree)?;
+            let tree = dst.find_tree(tree_oid)?;
+
+            let committer = Signature::new(
+                commit.committer.name()?,
+                commit.committer.email()?,
+                &commit.time,
+            )?;
+
+            let new_commit = mk_new_commmit(
+                dst,
+                &new_parents.iter().collect::<Vec<_>>(),
                 &commit.author,
-                &commit.committer,
+                &committer,
                 &commit.message,
-                &tree,
-                &new_parents.iter().collect_vec(),
+                tree,
             )?;
 
             rewritten.insert(commit.oid, new_commit);
 
+            let new_commit = dst.find_commit(new_commit)?;
+
             eprintln!("moved {}", commit.message);
 
-            dst.find_commit(new_commit)
+            Ok::<_, git2::Error>(new_commit)
         })
         .into_diagnostic()?;
 
@@ -230,6 +253,72 @@ fn migrate_commits(
     //     .for_each(|(old, new)| println!("{old}->{new}"));
 
     Ok(())
+}
+
+fn mk_new_commmit(
+    destination: &Repository,
+    new_parents: &[&Commit<'_>],
+    author: &Signature<'_>,
+    committer: &Signature<'_>,
+    message: &str,
+    tree: Tree<'_>,
+) -> Result<Oid, git2::Error> {
+    destination.commit(None, author, committer, message, &tree, new_parents)
+}
+
+fn mk_new_tree(
+    destination: &Repository,
+    prefix: Option<&str>,
+    commit: &CommitBuilder<'_>,
+    base_tree: Tree<'_>,
+) -> Result<Oid, git2::Error> {
+    let source_tree = destination.find_tree(commit.commit.tree_id())?;
+
+    let ancestor = if commit.commit.parent_count() > 0 {
+        let source_parent = destination.find_commit(commit.commit.parent_id(0)?)?;
+        source_parent.tree()?
+    } else {
+        let empty_oid = destination.treebuilder(None)?.write()?;
+        destination.find_tree(empty_oid)?
+    };
+
+    if let Some(prefix) = prefix {
+        // Merge inside the prefixed directory.
+        let existing_tree = base_tree
+            .get_path(Path::new(prefix))
+            .ok()
+            .and_then(|entry| destination.find_tree(entry.id()).ok());
+
+        let empty_oid = destination.treebuilder(None)?.write()?;
+        let existing_tree = match existing_tree {
+            Some(tree) => tree,
+            None => destination.find_tree(empty_oid)?,
+        };
+
+        let mut index = destination.merge_trees(&ancestor, &existing_tree, &source_tree, None)?;
+
+        if index.has_conflicts() {
+            return Err(git2::Error::from_str(
+                "conflicts while merging imported commit",
+            ));
+        }
+
+        let merged_oid = index.write_tree_to(destination)?;
+
+        let mut builder = destination.treebuilder(Some(&base_tree))?;
+        builder.insert(prefix, merged_oid, 0o040000)?;
+        builder.write()
+    } else {
+        let mut index = destination.merge_trees(&ancestor, &base_tree, &source_tree, None)?;
+
+        if index.has_conflicts() {
+            return Err(git2::Error::from_str(
+                "conflicts while merging imported commit",
+            ));
+        }
+
+        index.write_tree_to(destination)
+    }
 }
 
 fn import_objects(
@@ -253,43 +342,4 @@ fn import_objects(
     remote.fetch(&[&refspec], None, None)?;
 
     Ok(())
-}
-
-fn prefixed_tree(
-    repo: &Repository,
-    source_tree: &git2::Tree,
-    prefix: &str,
-) -> Result<Oid, git2::Error> {
-    let source_tree_oid = copy_tree(repo, source_tree)?;
-
-    let mut root = repo.treebuilder(None)?;
-
-    root.insert(prefix, source_tree_oid, 0o040000)?;
-
-    root.write()
-}
-
-fn copy_tree(repo: &Repository, source: &git2::Tree) -> Result<Oid, git2::Error> {
-    let mut builder = repo.treebuilder(None)?;
-
-    for entry in source.iter() {
-        let name = entry.name().unwrap();
-
-        match entry.kind() {
-            Some(git2::ObjectType::Blob) => {
-                builder.insert(name, entry.id(), entry.filemode())?;
-            }
-
-            Some(git2::ObjectType::Tree) => {
-                let child = repo.find_tree(entry.id())?;
-                let child_oid = copy_tree(repo, &child)?;
-
-                builder.insert(name, child_oid, entry.filemode())?;
-            }
-
-            _ => {}
-        }
-    }
-
-    builder.write()
 }
